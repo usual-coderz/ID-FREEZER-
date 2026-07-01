@@ -9,7 +9,7 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_API_ID = 22657083
 DEFAULT_API_HASH = "d6186691704bd901bdab275ceaab88f3"
-DEFAULT_BOT_TOKEN = "18944414129:AAFMKF4IBLrS6MJqxtRMHbj_pS36Gryglow"
+DEFAULT_BOT_TOKEN = "8944414129:AAFMKF4IBLrS6MJqxtRMHbj_pS36Gryglow"
 DEFAULT_OWNER_IDS = [8919742591]
 DEFAULT_MONGO_URI = "mongodb+srv://nexacoders2_db_user:dxYh7QOdHvH6OVdd@cluster0.f4qxcbk.mongodb.net/?appName=Cluster0"
 
