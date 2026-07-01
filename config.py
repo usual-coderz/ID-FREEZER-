@@ -39,18 +39,27 @@ def _parse_int_env(name: str, default: int) -> int:
 
 class Config:
     ALLOW_DEFAULTS = os.getenv("ALLOW_DEFAULTS", "0") == "1"
-    API_ID = _parse_int_env("API_ID", 0)
-    API_HASH = os.getenv("API_HASH") or ""
-    BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
-    _owner_raw = os.getenv("OWNER_IDS", "")
+
+    API_ID = _parse_int_env("API_ID", DEFAULT_API_ID)
+    API_HASH = os.getenv("API_HASH", DEFAULT_API_HASH)
+    BOT_TOKEN = os.getenv("BOT_TOKEN", DEFAULT_BOT_TOKEN)
+
+    _owner_raw = os.getenv(
+        "OWNER_IDS",
+        ",".join(map(str, DEFAULT_OWNER_IDS))
+    )
     OWNERS, _OWNER_INVALID = _parse_owner_ids(_owner_raw)
-    MONGO_URI = os.getenv("MONGO_URI") or ""
+
+    MONGO_URI = os.getenv("MONGO_URI", DEFAULT_MONGO_URI)
+
     DB_NAME = os.getenv("DB_NAME", "preban_db")
     PREBAN_WORKERS = _parse_int_env("PREBAN_WORKERS", 2)
     SESSION_CONCURRENCY = _parse_int_env("SESSION_CONCURRENCY", 3)
     QUEUE_MAXSIZE = _parse_int_env("QUEUE_MAXSIZE", 0)
+
     _prefix_raw = os.getenv("COMMAND_PREFIXES", "/ ! .")
     COMMAND_PREFIXES = [p for p in re.split(r"[,\s]+", _prefix_raw.strip()) if p]
+
     if not COMMAND_PREFIXES:
         COMMAND_PREFIXES = ["/"]
     elif "/" not in COMMAND_PREFIXES:
