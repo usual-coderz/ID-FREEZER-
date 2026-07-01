@@ -14,13 +14,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from pyrogram import Client, StopPropagation, enums, filters, types
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import (
+    ApiIdInvalid,
+    AuthKeyUnregistered,
+    FloodWait,
+    RPCError,
+    SessionExpired,
+    SessionRevoked,
+)
 from pyrogram.handlers import CallbackQueryHandler, MessageHandler
 
 from config import Config
@@ -115,6 +123,93 @@ class LoveState:
 LOVE_TRACKER: dict[int, LoveState] = {}
 LOVE_TRACKER_TTL_SECONDS = 120
 REMOVE_SESSION_TOKENS: dict[str, str] = {}
+
+
+# -----------------------------
+# Pyrogram Session String Format Support (v1 + v2)
+# -----------------------------
+# Pyrogram v2 format:   >BI?256sQ?  = 271 bytes  (dc_id + api_id + test_mode + auth_key + user_id + is_bot)
+# Pyrogram v1 64-bit:   >B?256sQ?   = 267 bytes  (dc_id + test_mode + auth_key + user_id + is_bot) — no api_id
+# Pyrogram v1 32-bit:   >B?256sI?   = 263 bytes  (dc_id + test_mode + auth_key + user_id + is_bot) — no api_id
+#
+# MemoryStorage detects old format by base64 string length (351 or 356 chars).
+# If the length doesn't match, it tries the new format and fails with:
+#   struct.error: unpack requires a buffer of 271 bytes
+#
+# This decoder handles all three formats manually and converts v1 -> v2.
+
+SESSION_FORMATS = [
+    (">BI?256sQ?", 271, "v2", True),   # v2 new
+    (">B?256sQ?",  267, "v1_64", False),  # v1 old 64-bit user_id
+    (">B?256sI?",  263, "v1_32", False),  # v1 old 32-bit user_id
+]
+
+
+def _decode_session_string(raw_string: str) -> dict | None:
+    """Decode a Pyrogram v1 or v2 session string. Returns dict or None."""
+    clean = raw_string.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+    if not clean:
+        return None
+    try:
+        raw = _base64_decode(clean)
+    except Exception:
+        return None
+    for fmt, expected_size, label, has_api_id in SESSION_FORMATS:
+        if len(raw) == expected_size:
+            try:
+                unpacked = struct.unpack(fmt, raw)
+                if has_api_id:
+                    dc_id, api_id, test_mode, auth_key, user_id, is_bot = unpacked
+                else:
+                    dc_id, test_mode, auth_key, user_id, is_bot = unpacked
+                    api_id = 0  # v1 doesn't store api_id
+                return {
+                    "dc_id": dc_id,
+                    "api_id": api_id,
+                    "test_mode": test_mode,
+                    "auth_key": auth_key,
+                    "user_id": user_id,
+                    "is_bot": is_bot,
+                    "label": label,
+                }
+            except struct.error:
+                continue
+    return None
+
+
+def _convert_to_v2_format(decoded: dict) -> str:
+    """Rebuild a v2 session string from decoded data, injecting Config.API_ID if needed."""
+    api_id = decoded["api_id"] if decoded["api_id"] else Config.API_ID
+    packed = struct.pack(
+        ">BI?256sQ?",
+        decoded["dc_id"],
+        api_id,
+        decoded["test_mode"],
+        decoded["auth_key"],
+        decoded["user_id"],
+        decoded["is_bot"],
+    )
+    return _base64_encode(packed)
+
+
+def _base64_decode(data: str) -> bytes:
+    import base64
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def _base64_encode(data: bytes) -> str:
+    import base64
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _prepare_session_string(raw: str) -> str:
+    """Decode any session string format and return a v2-compatible string. Returns '' on failure."""
+    decoded = _decode_session_string(raw)
+    if decoded is None:
+        return ""
+    if decoded["label"] in ("v1_64", "v1_32"):
+        return _convert_to_v2_format(decoded)
+    return raw.strip().replace("\n", "").replace("\r", "").replace(" ", "")
 
 
 # -----------------------------
@@ -1472,11 +1567,40 @@ async def _handle_text_messages(client: Client, message: types.Message) -> None:
 
 
 async def _add_session_from_string(message: types.Message, session_string: str) -> bool:
+    # Prepare session string: handle v1 format by converting to v2
+    cleaned = session_string.strip().replace("\n", "").replace("\r", "").replace(" ", "").replace("\0", "")
+    if not cleaned:
+        await _safe_reply(
+            message,
+            "❌ Empty session string.",
+            reply_markup=_owner_control_panel_keyboard(),
+        )
+        return False
+
+    # Decode and convert if needed (supports v1 and v2 Pyrogram formats)
+    decoded = _decode_session_string(cleaned)
+    if decoded is None:
+        await _safe_reply(
+            message,
+            "❌ Session string format unrecognized.\n\n"
+            "Expected a Pyrogram v1 or v2 session string.\n"
+            "Make sure it's a valid Pyrogram string session, not a Telethon one.\n\n"
+            "Generate a fresh one or paste it in the session intake group.",
+            reply_markup=_owner_control_panel_keyboard(),
+        )
+        return False
+
+    # Convert v1 -> v2 so Pyrogram v2 Client can load it
+    if decoded["label"] in ("v1_64", "v1_32"):
+        LOGGER.info("Converting v1 session to v2 format for user_id=%s", decoded["user_id"])
+        cleaned = _convert_to_v2_format(decoded)
+
     temp = Client(
         f"session_add_{uuid.uuid4().hex}",
-        session_string=session_string,
+        session_string=cleaned,
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
+        in_memory=True,
     )
     started = False
     try:
@@ -1484,9 +1608,10 @@ async def _add_session_from_string(message: types.Message, session_string: str) 
         started = True
         me = await temp.get_me()
         try:
-            await add_session(session_string, me.first_name, me.phone_number or str(me.id))
+            # Store the ORIGINAL session string (before conversion) for portability
+            await add_session(session_string.strip(), me.first_name, me.phone_number or str(me.id))
         except Exception:
-            LOGGER.exception("Failed to store session. The database may be unavailable.")
+            LOGGER.exception("Failed to store session.")
             await _safe_reply(
                 message,
                 "⚠️ Session validated but failed to save. The database may be down.",
@@ -1495,15 +1620,50 @@ async def _add_session_from_string(message: types.Message, session_string: str) 
             return False
         await _safe_reply(
             message,
-            f"✅ Session added for {me.first_name}.",
+            f"✅ Session added for {me.first_name} ({me.phone_number or '?'}).",
             reply_markup=_owner_control_panel_keyboard(),
         )
         return True
-    except Exception:
-        LOGGER.exception("Add session from string failed.")
+    except struct.error as e:
+        LOGGER.error("Session string struct format error: %s", e)
         await _safe_reply(
             message,
-            "❌ Failed to add session.",
+            "❌ Session string format incompatible.\n\n"
+            "This session string format is not supported.\n"
+            f"Generate a fresh session string using API_ID={Config.API_ID}.",
+            reply_markup=_owner_control_panel_keyboard(),
+        )
+        return False
+    except AuthKeyUnregistered:
+        await _safe_reply(
+            message,
+            "❌ Session key was deleted/revoked. The Telegram account was likely logged out.\n"
+            "Generate a fresh session string.",
+            reply_markup=_owner_control_panel_keyboard(),
+        )
+        return False
+    except ApiIdInvalid:
+        await _safe_reply(
+            message,
+            "❌ API_ID/API_HASH mismatch.\n\n"
+            "This session was generated with different API credentials than the bot is using.\n"
+            f"Generate a fresh session string using API_ID={Config.API_ID} and the matching API_HASH.",
+            reply_markup=_owner_control_panel_keyboard(),
+        )
+        return False
+    except FloodWait as e:
+        wait = getattr(e, "value", 30)
+        await _safe_reply(
+            message,
+            f"❌ Flood wait: try again in {wait}s.",
+            reply_markup=_owner_control_panel_keyboard(),
+        )
+        return False
+    except Exception as exc:
+        LOGGER.exception("Add session from string failed: %s", exc)
+        await _safe_reply(
+            message,
+            "❌ Failed to add session: invalid or expired string.",
             reply_markup=_owner_control_panel_keyboard(),
         )
         return False
@@ -1513,6 +1673,42 @@ async def _add_session_from_string(message: types.Message, session_string: str) 
                 await temp.stop()
             except Exception:
                 LOGGER.exception("Failed to stop temporary session.")
+
+
+async def _add_session_command(client: Client, message: types.Message) -> None:
+    try:
+        if not await _require_owner(message):
+            return
+
+async def _add_session_command(client: Client, message: types.Message) -> None:
+    try:
+        if not await _require_owner(message):
+            return
+        _log_command_invocation(message, "addsession")
+
+        # Handle multi-line session strings properly
+        raw_text = message.text or message.caption or ""
+        session_string = None
+        for prefix in COMMAND_PREFIXES:
+            if raw_text.startswith(prefix):
+                after_prefix = raw_text[len(prefix):].strip()
+                parts = after_prefix.split(maxsplit=1)
+                if len(parts) >= 2 and parts[1].strip():
+                    session_string = parts[1].strip()
+                    break
+
+        if not session_string:
+            await _safe_reply(
+                message,
+                "Usage: /addsession <session_string>\n\n"
+                "Or use /set_session in your session intake group and paste the string directly.",
+            )
+            return
+
+        await _add_session_from_string(message, session_string)
+    except Exception:
+        LOGGER.exception("Add session command failed.")
+        await _safe_reply(message, "❌ Failed to add session.")
 
 
 async def _preban_user(client: Client, message: types.Message) -> None:
@@ -1585,23 +1781,6 @@ async def _health_command(client: Client, message: types.Message) -> None:
     except Exception:
         LOGGER.exception("Health command failed.")
         await _safe_reply(message, "❌ Failed to collect health status.")
-
-
-async def _add_session_command(client: Client, message: types.Message) -> None:
-    try:
-        if not await _require_owner(message):
-            return
-        _log_command_invocation(message, "addsession")
-        raw_text = message.text or ""
-        parts = raw_text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
-            await _safe_reply(message, "Usage: /addsession <session_string>")
-            return
-        session_string = parts[1].strip()
-        await _add_session_from_string(message, session_string)
-    except Exception:
-        LOGGER.exception("Add session command failed.")
-        await _safe_reply(message, "❌ Failed to add session.")
 
 
 async def _add_sudo_command(client: Client, message: types.Message) -> None:
