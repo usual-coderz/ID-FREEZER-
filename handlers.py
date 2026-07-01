@@ -13,6 +13,7 @@ from __future__ import annotations
 #   chat_id normalization for log/session groups, and stable /start UI flows.
 
 import asyncio
+import base64
 import logging
 import struct
 import time
@@ -126,32 +127,35 @@ REMOVE_SESSION_TOKENS: dict[str, str] = {}
 
 
 # -----------------------------
-# Pyrogram Session String Format Support (v1 + v2)
+# Session String Format Support (Pyrogram v1 + v2)
 # -----------------------------
+
 # Pyrogram v2 format:   >BI?256sQ?  = 271 bytes  (dc_id + api_id + test_mode + auth_key + user_id + is_bot)
 # Pyrogram v1 64-bit:   >B?256sQ?   = 267 bytes  (dc_id + test_mode + auth_key + user_id + is_bot) — no api_id
 # Pyrogram v1 32-bit:   >B?256sI?   = 263 bytes  (dc_id + test_mode + auth_key + user_id + is_bot) — no api_id
-#
-# MemoryStorage detects old format by base64 string length (351 or 356 chars).
-# If the length doesn't match, it tries the new format and fails with:
-#   struct.error: unpack requires a buffer of 271 bytes
-#
-# This decoder handles all three formats manually and converts v1 -> v2.
 
 SESSION_FORMATS = [
-    (">BI?256sQ?", 271, "v2", True),   # v2 new
-    (">B?256sQ?",  267, "v1_64", False),  # v1 old 64-bit user_id
-    (">B?256sI?",  263, "v1_32", False),  # v1 old 32-bit user_id
+    (">BI?256sQ?", 271, "v2", True),
+    (">B?256sQ?",  267, "v1_64", False),
+    (">B?256sI?",  263, "v1_32", False),
 ]
 
 
+def _b64_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def _b64_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
 def _decode_session_string(raw_string: str) -> dict | None:
-    """Decode a Pyrogram v1 or v2 session string. Returns dict or None."""
+    """Decode Pyrogram v1 or v2 session string. Returns dict or None."""
     clean = raw_string.strip().replace("\n", "").replace("\r", "").replace(" ", "")
     if not clean:
         return None
     try:
-        raw = _base64_decode(clean)
+        raw = _b64_decode(clean)
     except Exception:
         return None
     for fmt, expected_size, label, has_api_id in SESSION_FORMATS:
@@ -162,7 +166,7 @@ def _decode_session_string(raw_string: str) -> dict | None:
                     dc_id, api_id, test_mode, auth_key, user_id, is_bot = unpacked
                 else:
                     dc_id, test_mode, auth_key, user_id, is_bot = unpacked
-                    api_id = 0  # v1 doesn't store api_id
+                    api_id = 0
                 return {
                     "dc_id": dc_id,
                     "api_id": api_id,
@@ -177,8 +181,8 @@ def _decode_session_string(raw_string: str) -> dict | None:
     return None
 
 
-def _convert_to_v2_format(decoded: dict) -> str:
-    """Rebuild a v2 session string from decoded data, injecting Config.API_ID if needed."""
+def _convert_to_v2_string(decoded: dict) -> str:
+    """Rebuild a v2-format session string from decoded data, using Config.API_ID if needed."""
     api_id = decoded["api_id"] if decoded["api_id"] else Config.API_ID
     packed = struct.pack(
         ">BI?256sQ?",
@@ -189,26 +193,17 @@ def _convert_to_v2_format(decoded: dict) -> str:
         decoded["user_id"],
         decoded["is_bot"],
     )
-    return _base64_encode(packed)
-
-
-def _base64_decode(data: str) -> bytes:
-    import base64
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
-
-
-def _base64_encode(data: bytes) -> str:
-    import base64
-    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+    return _b64_encode(packed)
 
 
 def _prepare_session_string(raw: str) -> str:
-    """Decode any session string format and return a v2-compatible string. Returns '' on failure."""
+    """Decode any format and return a v2-compatible session string. Returns empty string on failure."""
     decoded = _decode_session_string(raw)
     if decoded is None:
         return ""
     if decoded["label"] in ("v1_64", "v1_32"):
-        return _convert_to_v2_format(decoded)
+        LOGGER.info("Converting %s session to v2 format for user_id=%s", decoded["label"], decoded["user_id"])
+        return _convert_to_v2_string(decoded)
     return raw.strip().replace("\n", "").replace("\r", "").replace(" ", "")
 
 
@@ -1566,38 +1561,35 @@ async def _handle_text_messages(client: Client, message: types.Message) -> None:
         await _safe_reply(message, "❌ Something went wrong. Please try again.")
 
 
-async def _add_session_from_string(message: types.Message, session_string: str) -> bool:
-    # Prepare session string: handle v1 format by converting to v2
-    cleaned = session_string.strip().replace("\n", "").replace("\r", "").replace(" ", "").replace("\0", "")
+async def _add_session_from_string(message: types.Message, raw_session_string: str) -> bool:
+    # Clean and decode the session string (supports Pyrogram v1 and v2 formats)
+    cleaned = raw_session_string.strip().replace("\n", "").replace("\r", "").replace(" ", "").replace("\0", "")
     if not cleaned:
-        await _safe_reply(
-            message,
-            "❌ Empty session string.",
-            reply_markup=_owner_control_panel_keyboard(),
-        )
+        await _safe_reply(message, "❌ Empty session string.", reply_markup=_owner_control_panel_keyboard())
         return False
 
-    # Decode and convert if needed (supports v1 and v2 Pyrogram formats)
+    # Decode and convert v1 -> v2 if needed
     decoded = _decode_session_string(cleaned)
     if decoded is None:
         await _safe_reply(
             message,
             "❌ Session string format unrecognized.\n\n"
             "Expected a Pyrogram v1 or v2 session string.\n"
-            "Make sure it's a valid Pyrogram string session, not a Telethon one.\n\n"
-            "Generate a fresh one or paste it in the session intake group.",
+            "Make sure it's a valid Pyrogram string session.\n\n"
+            "Try using /set_session in your session intake group and paste it there.",
             reply_markup=_owner_control_panel_keyboard(),
         )
         return False
 
-    # Convert v1 -> v2 so Pyrogram v2 Client can load it
+    # Convert v1 format to v2 so Pyrogram v2 client can load it
+    session_string_for_client = cleaned
     if decoded["label"] in ("v1_64", "v1_32"):
-        LOGGER.info("Converting v1 session to v2 format for user_id=%s", decoded["user_id"])
-        cleaned = _convert_to_v2_format(decoded)
+        LOGGER.info("Converting %s session to v2 format for user_id=%s", decoded["label"], decoded["user_id"])
+        session_string_for_client = _convert_to_v2_string(decoded)
 
     temp = Client(
         f"session_add_{uuid.uuid4().hex}",
-        session_string=cleaned,
+        session_string=session_string_for_client,
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
         in_memory=True,
@@ -1608,8 +1600,8 @@ async def _add_session_from_string(message: types.Message, session_string: str) 
         started = True
         me = await temp.get_me()
         try:
-            # Store the ORIGINAL session string (before conversion) for portability
-            await add_session(session_string.strip(), me.first_name, me.phone_number or str(me.id))
+            # Store original string (portable across Pyrogram versions)
+            await add_session(raw_session_string.strip(), me.first_name, me.phone_number or str(me.id))
         except Exception:
             LOGGER.exception("Failed to store session.")
             await _safe_reply(
@@ -1625,11 +1617,10 @@ async def _add_session_from_string(message: types.Message, session_string: str) 
         )
         return True
     except struct.error as e:
-        LOGGER.error("Session string struct format error: %s", e)
+        LOGGER.error("Session string struct error: %s", e)
         await _safe_reply(
             message,
             "❌ Session string format incompatible.\n\n"
-            "This session string format is not supported.\n"
             f"Generate a fresh session string using API_ID={Config.API_ID}.",
             reply_markup=_owner_control_panel_keyboard(),
         )
@@ -1637,7 +1628,7 @@ async def _add_session_from_string(message: types.Message, session_string: str) 
     except AuthKeyUnregistered:
         await _safe_reply(
             message,
-            "❌ Session key was deleted/revoked. The Telegram account was likely logged out.\n"
+            "❌ Session key was deleted or revoked. The Telegram account was likely logged out.\n"
             "Generate a fresh session string.",
             reply_markup=_owner_control_panel_keyboard(),
         )
@@ -1646,26 +1637,18 @@ async def _add_session_from_string(message: types.Message, session_string: str) 
         await _safe_reply(
             message,
             "❌ API_ID/API_HASH mismatch.\n\n"
-            "This session was generated with different API credentials than the bot is using.\n"
-            f"Generate a fresh session string using API_ID={Config.API_ID} and the matching API_HASH.",
+            "This session was generated with different API credentials.\n"
+            f"Generate a fresh session string using API_ID={Config.API_ID}.",
             reply_markup=_owner_control_panel_keyboard(),
         )
         return False
     except FloodWait as e:
         wait = getattr(e, "value", 30)
-        await _safe_reply(
-            message,
-            f"❌ Flood wait: try again in {wait}s.",
-            reply_markup=_owner_control_panel_keyboard(),
-        )
+        await _safe_reply(message, f"❌ Flood wait: try again in {wait}s.", reply_markup=_owner_control_panel_keyboard())
         return False
     except Exception as exc:
-        LOGGER.exception("Add session from string failed: %s", exc)
-        await _safe_reply(
-            message,
-            "❌ Failed to add session: invalid or expired string.",
-            reply_markup=_owner_control_panel_keyboard(),
-        )
+        LOGGER.exception("Add session failed: %s", exc)
+        await _safe_reply(message, "❌ Failed to add session: invalid or expired string.", reply_markup=_owner_control_panel_keyboard())
         return False
     finally:
         if started:
@@ -1679,32 +1662,27 @@ async def _add_session_command(client: Client, message: types.Message) -> None:
     try:
         if not await _require_owner(message):
             return
+        _log_command_invocation(message, "addsession")
+        raw_text = message.text or ""
+        parts = raw_text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await _safe_reply(message, "Usage: /addsession <session_string>")
+            return
+        session_string = parts[1].strip()
+        await _add_session_from_string(message, session_string)
+
 
 async def _add_session_command(client: Client, message: types.Message) -> None:
     try:
         if not await _require_owner(message):
             return
         _log_command_invocation(message, "addsession")
-
-        # Handle multi-line session strings properly
-        raw_text = message.text or message.caption or ""
-        session_string = None
-        for prefix in COMMAND_PREFIXES:
-            if raw_text.startswith(prefix):
-                after_prefix = raw_text[len(prefix):].strip()
-                parts = after_prefix.split(maxsplit=1)
-                if len(parts) >= 2 and parts[1].strip():
-                    session_string = parts[1].strip()
-                    break
-
-        if not session_string:
-            await _safe_reply(
-                message,
-                "Usage: /addsession <session_string>\n\n"
-                "Or use /set_session in your session intake group and paste the string directly.",
-            )
+        raw_text = message.text or ""
+        parts = raw_text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await _safe_reply(message, "Usage: /addsession <session_string>")
             return
-
+        session_string = parts[1].strip()
         await _add_session_from_string(message, session_string)
     except Exception:
         LOGGER.exception("Add session command failed.")
@@ -1720,23 +1698,17 @@ async def _preban_user(client: Client, message: types.Message) -> None:
         if not is_owner and not await has_access(message.from_user.id):
             await _safe_reply(message, "❌ You are not authorized. Send payment proof to get access.")
             return
-
         if len(message.command) < 2:
             await _safe_reply(message, "Usage: /preban <user_id or @username>")
             return
-
         target_id, target_username, target_access_hash = await _resolve_preban_target(client, message.command[1])
-
         if target_id is None and target_username is None:
             await _safe_reply(message, "❌ Failed to resolve user.")
             return
-
         await _queue_preban_target(
-            client,
-            message,
+            client, message,
             requester_id=message.from_user.id,
-            target_id=target_id,
-            target_username=target_username,
+            target_id=target_id, target_username=target_username,
             target_access_hash=target_access_hash,
         )
     except Exception:
@@ -1771,8 +1743,7 @@ async def _health_command(client: Client, message: types.Message) -> None:
         queue_snapshot = await get_queue_snapshot()
         worker_status = get_worker_status()
         text = (
-            "✅ Database: "
-            f"{'OK' if db_ok else 'FAIL'}\n"
+            f"✅ Database: {'OK' if db_ok else 'FAIL'}\n"
             f"📦 Sessions: {session_count}\n"
             f"🔁 Workers Active: {worker_status['alive']}\n"
             f"📈 Queue: {queue_snapshot['queue_length']}"
@@ -1931,17 +1902,10 @@ async def _set_command(client: Client, message: types.Message) -> None:
 # Fallbacks
 # -----------------------------
 
-
 def register_fallbacks(app: Client) -> None:
     LOGGER.info("Registering fallback handlers.")
-    app.add_handler(
-        MessageHandler(_unknown_command, filters.text & MESSAGE_PRIVATE_OR_GROUP_FILTER),
-        group=100,
-    )
-    app.add_handler(
-        MessageHandler(_fallback_command_response, filters.text & MESSAGE_PRIVATE_OR_GROUP_FILTER),
-        group=200,
-    )
+    app.add_handler(MessageHandler(_unknown_command, filters.text & MESSAGE_PRIVATE_OR_GROUP_FILTER), group=100)
+    app.add_handler(MessageHandler(_fallback_command_response, filters.text & MESSAGE_PRIVATE_OR_GROUP_FILTER), group=200)
 
 
 async def _unknown_command(client: Client, message: types.Message) -> None:
@@ -1954,10 +1918,7 @@ async def _unknown_command(client: Client, message: types.Message) -> None:
         if await _reject_anonymous_command(message):
             return
         _log_command_invocation(message, f"unknown:{command}")
-        await _safe_reply(
-            message,
-            "❓ Unknown command.\nUse /help to see available commands.",
-        )
+        await _safe_reply(message, "❓ Unknown command.\nUse /help to see available commands.")
     except Exception:
         LOGGER.exception("Unknown command handler failed.")
         await _safe_reply(message, "❌ Failed to process command.")
