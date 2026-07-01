@@ -8,7 +8,7 @@ from pyrogram.errors import RPCError
 from config import API_ID, API_HASH, BOT_TOKEN, DEBUG
 import handlers
 import core
-from session_handler import register_session_handler
+#from session_handler import register_session_handler
 from payment_handler import register_payment_handler
 from queue_worker import start_queue_monitor
 
@@ -61,7 +61,7 @@ def main():
     try:
         # Register all Telegram handlers
         handlers.register(app)
-        register_session_handler(app)
+        #register_session_handler(app)
         register_payment_handler(app)
         logger.info("Handlers registered")
 
