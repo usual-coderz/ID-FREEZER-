@@ -1,4 +1,3 @@
-import time
 import asyncio
 from telethon import TelegramClient, errors
 
@@ -1124,7 +1123,7 @@ general_msgs = [
 # Combine: 25% praise + 75% general
 MESSAGES = praise_msgs + general_msgs
 
-# If we need exactly 1000+, pad with more general messages
+# Pad with more general messages to hit 1000+
 while len(MESSAGES) < 1000:
     MESSAGES.append(f"Keep the conversation going in this amazing group! Day {len(MESSAGES) + 1} of being active here!")
 
@@ -1138,11 +1137,11 @@ SEND_INTERVAL = 6  # Har 6 second mein 1 message
 # --- MAIN LOGIC ---
 async def main():
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    
+
     try:
         await client.start(phone=PHONE_NUMBER)
         print("✅ Successfully logged in to Telegram!")
-        
+
         # Target group resolve karo
         try:
             entity = await client.get_entity(TARGET_GROUP)
@@ -1152,47 +1151,51 @@ async def main():
             print(f"❌ Failed to find/get group: {e}")
             print("💡 Make sure you are a member of this group!")
             return
-        
+
         message_index = 0
         total_sent = 0
-        
+
         print(f"🚀 Starting auto-messenger...")
         print(f"⏱️  Sending 1 message every 6 seconds")
         print(f"💬 Total messages in pool: {len(MESSAGES)}")
         print("=" * 50)
-        
+
         while True:
             # Reset index if all messages sent
             if message_index >= len(MESSAGES):
                 message_index = 0
                 print("🔄 All messages used once. Restarting from beginning...")
-            
+
             current_message = MESSAGES[message_index]
-            
+
             try:
                 await client.send_message(entity, current_message)
                 total_sent += 1
                 print(f"✅ [#{total_sent}] Sent: {current_message[:70]}...")
                 message_index += 1
-                
+
                 # Wait 6 seconds before next message
                 await asyncio.sleep(6)
-                
+
             except errors.FloodWaitError as e:
                 wait_seconds = e.seconds
                 print(f"⚠️ Flood wait: {wait_seconds}s ({wait_seconds/60:.1f} min)...")
                 await asyncio.sleep(wait_seconds + 5)
-                
+
             except errors.RPCError as e:
                 print(f"❌ Telegram API error: {e}")
                 await asyncio.sleep(30)
-                
+
             except Exception as e:
                 print(f"❌ Error: {e}")
                 await asyncio.sleep(10)
-                
+
     except Exception as e:
         print(f"❌ Fatal error: {e}")
     finally:
         await client.disconnect()
         print("🔌 Disconnected from Telegram.")
+
+# --- RUN THE SCRIPT ---
+if __name__ == "__main__":
+    asyncio.run(main())
